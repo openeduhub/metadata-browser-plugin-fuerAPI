@@ -32,6 +32,7 @@ const metadataCanvas = document.getElementById('metadata-canvas');
 let currentCanvasItem = null;
 let lastExtractedUrl = null;
 let extractCounter = 0;
+let screenshotDataUrl = null;
 
 // ============================================================================
 // LOADING HELPERS
@@ -105,7 +106,12 @@ function feedDataToCanvas(text, url) {
     metadataCanvas.apiUrl = API_URL;
     metadataCanvas.layout = 'plugin';
     metadataCanvas.highlightAi = false;
-    metadataCanvas.language = 'de';
+
+    // Pass captured screenshot as preview image to the web component
+    if (screenshotDataUrl) {
+        metadataCanvas.previewImage = screenshotDataUrl;
+        console.log('📸 Preview image set on web component');
+    }
 
     // Determine if this is a new URL (reset fields) or same URL (keep fields)
     const isNewUrl = !lastExtractedUrl || lastExtractedUrl !== url;
@@ -331,6 +337,21 @@ async function handleOpenCanvas() {
             }
         }
 
+        // Capture screenshot while the page is still visible (before switching to canvas)
+        try {
+            const screenshotResp = await chrome.runtime.sendMessage({ action: 'tabs.captureScreenshot' });
+            if (screenshotResp?.success && screenshotResp.dataUrl) {
+                screenshotDataUrl = screenshotResp.dataUrl;
+                console.log('📸 Screenshot captured:', Math.round(screenshotDataUrl.length / 1024), 'KB');
+            } else {
+                screenshotDataUrl = null;
+                console.warn('⚠️ Screenshot capture failed');
+            }
+        } catch (e) {
+            screenshotDataUrl = null;
+            console.warn('⚠️ Screenshot capture error:', e);
+        }
+
         hideLoading();
 
         const tempItem = {
@@ -393,6 +414,7 @@ function openCanvasForItem(item) {
 function closeCanvas() {
     console.log('🔙 Closing Canvas');
     currentCanvasItem = null;
+    screenshotDataUrl = null;
     switchView('main');
 }
 
@@ -403,12 +425,20 @@ function closeCanvas() {
 async function handleCanvasSaveMetadata(rawMetadata) {
     console.log('💾 Saving metadata from web component...', rawMetadata);
 
-    // The web component emits: { contextName, schemaVersion, metadataset, metadata: {...}, _origins }
+    // The web component emits: { contextName, schemaVersion, metadataset, metadataset_uri, metadata: {...}, _origins, _source_text }
     // The plugin upload expects flat keys like cclom:title at the top level.
-    // Unwrap if the actual field values are nested inside a 'metadata' property.
+    // Unwrap if the actual field values are nested inside a 'metadata' property,
+    // but preserve header fields needed for extended data (metadataset_uri, _source_text, etc.)
     let metadata = rawMetadata;
     if (rawMetadata && rawMetadata.metadata && typeof rawMetadata.metadata === 'object') {
-        metadata = rawMetadata.metadata;
+        metadata = { ...rawMetadata.metadata };
+        // Preserve header fields needed for extended data and schema resolution
+        const headerFields = ['contextName', 'schemaVersion', 'metadataset', 'metadataset_uri', '_origins', '_source_text'];
+        for (const key of headerFields) {
+            if (rawMetadata[key] !== undefined) {
+                metadata[key] = rawMetadata[key];
+            }
+        }
         // Preserve the source URL from the current item if not in metadata
         if (!metadata['ccm:wwwurl'] && currentCanvasItem?.url) {
             metadata['ccm:wwwurl'] = currentCanvasItem.url;
@@ -419,9 +449,12 @@ async function handleCanvasSaveMetadata(rawMetadata) {
         showLoading('Metadaten werden gespeichert...');
 
         // Send to background for repository upload
+        // Include previewUrl for guest mode (API captures screenshot server-side)
+        const previewUrl = getMetadataValue(metadata, 'ccm:wwwurl') || currentCanvasItem?.url || null;
         const response = await chrome.runtime.sendMessage({
             action: 'saveMetadata',
-            metadata: metadata
+            metadata: metadata,
+            previewUrl: previewUrl
         });
 
         hideLoading();
@@ -434,6 +467,27 @@ async function handleCanvasSaveMetadata(rawMetadata) {
             const nodeId = response.nodeId || response.node?.ref?.id;
             const repoUrl = nodeId ? `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}` : null;
             const favicon = await getFaviconForHistory();
+
+            // Upload screenshot as preview image (non-blocking)
+            if (screenshotDataUrl && nodeId) {
+                try {
+                    const { wloSession } = await chrome.storage.local.get('wloSession');
+                    const authHeader = wloSession?.authHeader;
+                    if (authHeader) {
+                        chrome.runtime.sendMessage({
+                            action: 'tabs.uploadPreview',
+                            nodeId,
+                            screenshotDataUrl,
+                            authHeader
+                        }).then(r => {
+                            if (r?.success) console.log('📸 Preview uploaded for', nodeId);
+                            else console.warn('⚠️ Preview upload response:', r);
+                        }).catch(e => console.warn('⚠️ Preview upload error:', e));
+                    }
+                } catch (e) {
+                    console.warn('⚠️ Preview upload skipped:', e);
+                }
+            }
 
             // Add to history
             await chrome.runtime.sendMessage({
